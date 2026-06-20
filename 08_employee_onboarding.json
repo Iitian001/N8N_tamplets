@@ -1,0 +1,341 @@
+{
+  "name": "Employee Onboarding Workflow",
+  "tags": ["hr", "onboarding", "employee", "welcome", "tasks"],
+  "description": "Automated onboarding: creates the employee record, provisions a Google Workspace account, adds them to groups, sends welcome emails, creates Asana tasks, and notifies the team. Fixes the original's broken webhook node (was misconfigured as a database operation) and non-existent Workspace Admin node.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Employee Onboarding\n**Flow:**\n1. Webhook receives new-hire data from your HRIS or onboarding form\n2. Validates required fields\n3. Creates the employee record in your DB with status \"Pending Onboarding\"\n4. In parallel: provisions Google Workspace account + adds to all-employees group, AND notifies the manager + sends welcome email + creates Asana tasks\n5. Once both branches finish, updates status to \"Onboarding Complete\"\n\n**Fixes from original:**\n- The webhook node's parameters were a copy-paste of a database \"create\" config — fixed to be an actual webhook\n- `n8n-nodes-base.googleWorkspaceAdmin` is not a real n8n node type — replaced with an `httpRequest` call to the Admin SDK Directory API\n- The DB \"insert\" step that should create the initial record was missing entirely — added\n\n**Setup required:** Google Workspace Admin SDK credentials (domain-wide delegation), Slack, SendGrid, Asana, Postgres (employees table).",
+        "height": 440,
+        "width": 420
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [200, -180]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "start-onboarding",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Onboarding Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "start-onboarding"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body || $input.first().json;\nconst required = ['firstName', 'lastName', 'email', 'department', 'manager', 'startDate'];\nconst missing = required.filter(f => !body[f]);\n\nif (missing.length) {\n  return [{ json: { isValid: false, missing } }];\n}\n\nreturn [{\n  json: {\n    isValid: true,\n    firstName: body.firstName,\n    lastName: body.lastName,\n    email: body.email,\n    department: body.department,\n    manager: body.manager,\n    startDate: body.startDate\n  }\n}];"
+      },
+      "name": "Validate Onboarding Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "valid",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Data Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, missingFields: $json.missing } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "name": "Validation Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [650, 550]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "insert",
+        "table": {
+          "table": "employees",
+          "schema": "public"
+        },
+        "columns": "first_name, last_name, email, department, manager, start_date, status",
+        "values": "={{ [[$json.firstName, $json.lastName, $json.email, $json.department, $json.manager, $json.startDate, 'Pending Onboarding']] }}"
+      },
+      "name": "Create Employee Record",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, message: 'Onboarding started' } }}",
+        "options": {}
+      },
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1150, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://admin.googleapis.com/admin/directory/v1/users",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "primaryEmail", "value": "={{ $('Validate Onboarding Data').item.json.email }}" }
+          ]
+        },
+        "jsonBody": "={{ { primaryEmail: $('Validate Onboarding Data').item.json.email, name: { givenName: $('Validate Onboarding Data').item.json.firstName, familyName: $('Validate Onboarding Data').item.json.lastName }, password: 'Welcome' + Math.floor(Math.random()*100000) + '!', changePasswordAtNextLogin: true } }}",
+        "options": {}
+      },
+      "name": "Create Google Workspace Account",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 100],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "googleApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Workspace Admin"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://admin.googleapis.com/admin/directory/v1/groups/all-employees@company.com/members",
+        "method": "POST",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "googleApi",
+        "sendBody": true,
+        "jsonBody": "={{ { email: $('Validate Onboarding Data').item.json.email, role: 'MEMBER' } }}",
+        "options": {}
+      },
+      "name": "Add to All-Employees Group",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1150, 100],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "googleApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Workspace Admin"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "#new-hires",
+        "text": "🎉 Welcome to the team!\n\n*Name:* {{ $('Validate Onboarding Data').item.json.firstName }} {{ $('Validate Onboarding Data').item.json.lastName }}\n*Email:* {{ $('Validate Onboarding Data').item.json.email }}\n*Department:* {{ $('Validate Onboarding Data').item.json.department }}\n*Manager:* {{ $('Validate Onboarding Data').item.json.manager }}\n*Start Date:* {{ $('Validate Onboarding Data').item.json.startDate }}\n\nGoogle Workspace account provisioned! 🚀",
+        "options": {}
+      },
+      "name": "Announce on Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1400, 100],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "hr@company.com",
+        "toEmail": "={{ $('Validate Onboarding Data').item.json.manager }}",
+        "subject": "New Team Member: {{ $('Validate Onboarding Data').item.json.firstName }} {{ $('Validate Onboarding Data').item.json.lastName }}",
+        "html": "<h2>Hi {{ $('Validate Onboarding Data').item.json.manager }},</h2><p><strong>{{ $('Validate Onboarding Data').item.json.firstName }} {{ $('Validate Onboarding Data').item.json.lastName }}</strong> starts on {{ $('Validate Onboarding Data').item.json.startDate }} in {{ $('Validate Onboarding Data').item.json.department }}.</p><p>Onboarding tasks have been created in Asana. Please prepare:</p><ul><li>Workspace setup</li><li>Welcome meeting</li><li>Team introduction</li></ul>",
+        "options": {}
+      },
+      "name": "Notify Manager",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [900, 450],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "hr@company.com",
+        "toEmail": "={{ $('Validate Onboarding Data').item.json.email }}",
+        "subject": "Welcome to Your Company! 🎉",
+        "html": "<h2>Welcome {{ $('Validate Onboarding Data').item.json.firstName }}!</h2><p>We're excited to have you join us on {{ $('Validate Onboarding Data').item.json.startDate }}.</p><p><strong>Your login:</strong><br>Email: {{ $('Validate Onboarding Data').item.json.email }}<br>Password: sent separately via a secure channel — check with IT if you haven't received it.</p><p>Day 1 agenda:<br>• 9:00 AM - Welcome at reception<br>• 9:30 AM - HR orientation<br>• 11:00 AM - IT setup<br>• 2:00 PM - Meet your manager</p><p>See you soon!<br>HR Team</p>",
+        "options": {}
+      },
+      "name": "Send Welcome Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1150, 450],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "task",
+        "operation": "create",
+        "workspace": "YOUR_ASANA_WORKSPACE_ID",
+        "project": "YOUR_ONBOARDING_PROJECT_ID",
+        "name": "Onboard {{ $('Validate Onboarding Data').item.json.firstName }} {{ $('Validate Onboarding Data').item.json.lastName }}",
+        "options": {
+          "notes": "New employee onboarding tasks for {{ $('Validate Onboarding Data').item.json.department }}",
+          "dueOn": "={{ $('Validate Onboarding Data').item.json.startDate }}"
+        }
+      },
+      "name": "Create Asana Task",
+      "type": "n8n-nodes-base.asana",
+      "typeVersion": 1,
+      "position": [1400, 450],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "asanaApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Asana Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "numberInputs": 2
+      },
+      "name": "Wait For Both Branches",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1650, 200]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "update",
+        "table": {
+          "table": "employees",
+          "schema": "public"
+        },
+        "columns": "status",
+        "values": "Onboarding Complete",
+        "where": {
+          "conditions": [
+            {
+              "column": "email",
+              "value": "={{ $('Validate Onboarding Data').item.json.email }}"
+            }
+          ]
+        }
+      },
+      "name": "Update Employee Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1900, 300],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Onboarding Webhook": {
+      "main": [[{"node": "Validate Onboarding Data", "type": "main", "index": 0}]]
+    },
+    "Validate Onboarding Data": {
+      "main": [[{"node": "Data Valid?", "type": "main", "index": 0}]]
+    },
+    "Data Valid?": {
+      "main": [
+        [{"node": "Create Employee Record", "type": "main", "index": 0}],
+        [{"node": "Validation Error Response", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Employee Record": {
+      "main": [
+        [
+          {"node": "Success Response", "type": "main", "index": 0},
+          {"node": "Create Google Workspace Account", "type": "main", "index": 0},
+          {"node": "Notify Manager", "type": "main", "index": 0}
+        ]
+      ]
+    },
+    "Create Google Workspace Account": {
+      "main": [[{"node": "Add to All-Employees Group", "type": "main", "index": 0}]]
+    },
+    "Add to All-Employees Group": {
+      "main": [[{"node": "Announce on Slack", "type": "main", "index": 0}]]
+    },
+    "Notify Manager": {
+      "main": [[{"node": "Send Welcome Email", "type": "main", "index": 0}]]
+    },
+    "Send Welcome Email": {
+      "main": [[{"node": "Create Asana Task", "type": "main", "index": 0}]]
+    },
+    "Announce on Slack": {
+      "main": [[{"node": "Wait For Both Branches", "type": "main", "index": 0}]]
+    },
+    "Create Asana Task": {
+      "main": [[{"node": "Wait For Both Branches", "type": "main", "index": 1}]]
+    },
+    "Wait For Both Branches": {
+      "main": [[{"node": "Update Employee Status", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

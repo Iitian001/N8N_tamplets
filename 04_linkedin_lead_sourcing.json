@@ -1,0 +1,334 @@
+{
+  "name": "LinkedIn Lead Sourcing to CRM (via Apify)",
+  "tags": ["linkedin", "leads", "sales", "prospecting", "apify"],
+  "description": "Sources LinkedIn leads through Apify's LinkedIn Search Scraper API (a compliant third-party data provider, not direct site scraping), deduplicates against your database, and syncs new leads to Airtable + Slack. IMPORTANT: this template intentionally avoids scraping linkedin.com directly. Direct scraping violates LinkedIn's Terms of Service and risks IP/account bans and legal exposure. Apify (or a similar licensed data provider) handles collection on their infrastructure under their own terms.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## LinkedIn Lead Sourcing (Compliant)\n**Why this design:** the original version of this template scraped linkedin.com directly with raw HTTP requests + cheerio. That breaks LinkedIn's ToS, gets IPs/accounts banned quickly, and selectors break every time LinkedIn changes its DOM.\n\n**This version instead:**\n1. Reads active search configs from Airtable\n2. Calls the Apify LinkedIn Search Scraper Actor via its official API (run-sync-get-dataset-items) for each config\n3. Deduplicates against your Postgres `leads` table by LinkedIn URL\n4. Inserts only new leads, then syncs them to Airtable for enrichment tracking\n5. Notifies #sales-intel on Slack with a count and sample\n\n**Setup required:**\n- Apify account + API token (use any LinkedIn search/people actor you're licensed for in the Apify Store)\n- Airtable: `linkedin_search_config` and `enriched_leads` tables\n- Postgres: `leads` table\n- Slack credential\n\n**You must still comply with LinkedIn's terms and applicable data-privacy law (GDPR/CCPA) for any contact data you store.**",
+        "height": 480,
+        "width": 420
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [200, -200]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "name": "Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "resource": "base",
+        "operation": "list",
+        "table": "linkedin_search_config",
+        "options": {
+          "filterByFormula": "{active} = TRUE()"
+        }
+      },
+      "name": "Get Search Configs",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Airtable Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize each search config into one item per config\nconst configs = $input.all().map(i => i.json);\n\nif (!configs.length) {\n  return [{ json: { noConfigs: true } }];\n}\n\nreturn configs.map(config => ({\n  json: {\n    searchUrl: config.search_url,\n    jobTitle: config.target_job_title,\n    companySize: config.company_size,\n    industry: config.industry,\n    searchConfigId: config.id,\n    maxResults: config.max_results_per_day || 50\n  }\n}));"
+      },
+      "name": "Process Search Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-configs",
+              "leftValue": "={{ $json.noConfigs }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEqual"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Has Active Configs?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apify.com/v2/acts/YOUR_APIFY_LINKEDIN_ACTOR_ID/run-sync-get-dataset-items",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            { "name": "searchUrl", "value": "={{ $json.searchUrl }}" },
+            { "name": "maxItems", "value": "={{ $json.maxResults }}" }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "name": "Run Apify LinkedIn Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1050, 200],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Apify API Token"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Map Apify's dataset item shape into our normalized lead shape.\n// Adjust field names below to match whichever Apify LinkedIn actor you use --\n// they vary by provider (e.g. name vs fullName, companyName vs currentCompany).\nconst items = $input.all().map(i => i.json);\nconst sourceConfig = $('Process Search Config').item.json;\n\nconst leads = items\n  .filter(item => item && (item.profileUrl || item.url))\n  .map(item => ({\n    json: {\n      name: item.fullName || item.name || '',\n      title: item.headline || item.title || '',\n      company: item.companyName || item.company || '',\n      linkedinUrl: item.profileUrl || item.url,\n      location: item.location || null,\n      sourceSearchId: sourceConfig.searchConfigId,\n      scrapedAt: new Date().toISOString()\n    }\n  }));\n\nreturn leads;"
+      },
+      "name": "Map Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 200]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "leads",
+          "schema": "public"
+        },
+        "columns": "id, linkedin_url",
+        "where": {
+          "conditions": [{
+            "column": "linkedin_url",
+            "value": "={{ $json.linkedinUrl }}",
+            "condition": "equal"
+          }]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "name": "Check Lead Exists",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 200],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Postgres Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Postgres select returns an array of matched rows in $json when queryBatching=single\nconst matches = $json;\nconst matchCount = Array.isArray(matches) ? matches.length : (matches.id ? 1 : 0);\n\nreturn [{\n  json: {\n    ...$('Map Lead Data').item.json,\n    isNew: matchCount === 0\n  }\n}];"
+      },
+      "name": "Flag New vs Existing",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1650, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "new-lead",
+              "leftValue": "={{ $json.isNew }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Is New Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1850, 200]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "insert",
+        "table": {
+          "table": "leads",
+          "schema": "public"
+        },
+        "columns": "name, title, company, linkedin_url, location, source_search_id, created_at, lead_status",
+        "values": "={{ [[$json.name, $json.title, $json.company, $json.linkedinUrl, $json.location, $json.sourceSearchId, $json.scrapedAt, 'New']] }}"
+      },
+      "name": "Insert New Lead",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2050, 100],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Postgres Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "base",
+        "operation": "create",
+        "table": "enriched_leads",
+        "fields": {
+          "name": "={{ $json.name }}",
+          "title": "={{ $json.title }}",
+          "company": "={{ $json.company }}",
+          "linkedin_url": "={{ $json.linkedinUrl }}",
+          "location": "={{ $json.location }}",
+          "source_search_id": "={{ $json.sourceSearchId }}",
+          "discovered_date": "={{ $json.scrapedAt }}",
+          "enrichment_status": "pending"
+        }
+      },
+      "name": "Save to Airtable",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 1,
+      "position": [2250, 100],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Airtable Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Aggregate all new leads from this run into a single summary item for Slack\nconst items = $input.all().map(i => i.json);\nreturn [{\n  json: {\n    count: items.length,\n    sampleTitle: items[0]?.title || 'N/A',\n    sampleCompany: items[0]?.company || 'N/A'\n  }\n}];"
+      },
+      "name": "Summarize New Leads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2450, 100]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-intel",
+        "text": "🔍 New Leads Sourced via Apify\n\n*Count:* {{ $json.count }} new leads\n*Sample role:* {{ $json.sampleTitle }} at {{ $json.sampleCompany }}\n\nView in Airtable for full enrichment status.",
+        "options": {}
+      },
+      "name": "Notify Sales Team",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [2650, 100],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily Trigger": {
+      "main": [[{"node": "Get Search Configs", "type": "main", "index": 0}]]
+    },
+    "Get Search Configs": {
+      "main": [[{"node": "Process Search Config", "type": "main", "index": 0}]]
+    },
+    "Process Search Config": {
+      "main": [[{"node": "Has Active Configs?", "type": "main", "index": 0}]]
+    },
+    "Has Active Configs?": {
+      "main": [
+        [{"node": "Run Apify LinkedIn Search", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Run Apify LinkedIn Search": {
+      "main": [[{"node": "Map Lead Data", "type": "main", "index": 0}]]
+    },
+    "Map Lead Data": {
+      "main": [[{"node": "Check Lead Exists", "type": "main", "index": 0}]]
+    },
+    "Check Lead Exists": {
+      "main": [[{"node": "Flag New vs Existing", "type": "main", "index": 0}]]
+    },
+    "Flag New vs Existing": {
+      "main": [[{"node": "Is New Lead?", "type": "main", "index": 0}]]
+    },
+    "Is New Lead?": {
+      "main": [
+        [{"node": "Insert New Lead", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Insert New Lead": {
+      "main": [[{"node": "Save to Airtable", "type": "main", "index": 0}]]
+    },
+    "Save to Airtable": {
+      "main": [[{"node": "Summarize New Leads", "type": "main", "index": 0}]]
+    },
+    "Summarize New Leads": {
+      "main": [[{"node": "Notify Sales Team", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": ""
+  }
+}

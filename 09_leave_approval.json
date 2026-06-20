@@ -1,0 +1,378 @@
+{
+  "name": "Leave Approval Automation",
+  "tags": ["hr", "leave", "approval", "vacation", "pto"],
+  "description": "End-to-end leave management: submit requests, check PTO balance, route to manager for approval/rejection, log to database, escalate if unanswered after 48 hours (once, not repeatedly).",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Leave Approval Automation\n**Flow:**\n1. Typeform submission parsed into a structured request\n2. Employee's manager + PTO balance looked up\n3. If balance is sufficient: request logged as Pending, manager emailed with Approve/Reject links\n4. If balance is insufficient: employee notified immediately, nothing logged as pending\n5. A separate scheduled check finds requests pending 48+ hours and escalates exactly once (marks `escalated = true` so it won't re-fire every 48h forever)\n6. A webhook receives the manager's Approve/Reject click and updates status + notifies the employee\n\n**Fixes from original:**\n- The Postgres insert had malformed `values` syntax mixing template literals oddly — rewritten as a proper array-of-rows expression\n- The escalation flow never marked requests as escalated, so it would re-alert every 48 hours indefinitely — fixed with an `escalated` flag\n- Added the missing approve/reject webhook handler that the manager's email links actually point to\n\n**Setup required:** Typeform webhook, Postgres (employees + leave_requests tables), SendGrid.",
+        "height": 480,
+        "width": 440
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [200, -220]
+    },
+    {
+      "parameters": {
+        "resource": "formSubmissions",
+        "formId": "leave-request-form",
+        "options": {}
+      },
+      "name": "Leave Form Submission",
+      "type": "n8n-nodes-base.typeformTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "leave-request"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst answers = data.answered_questions || [];\n\nconst find = (q) => answers.find(a => a.question === q)?.answer;\n\nconst totalDaysRaw = find('Total Days');\nconst totalDays = Number(totalDaysRaw) || 0;\n\nreturn [{\n  json: {\n    employeeName: find('Your Name') || 'Unknown',\n    employeeEmail: data.email || find('Email'),\n    leaveType: find('Leave Type') || 'Unspecified',\n    startDate: find('Start Date'),\n    endDate: find('End Date'),\n    totalDays,\n    reason: find('Reason') || '',\n    requestId: 'LR-' + Date.now()\n  }\n}];"
+      },
+      "name": "Parse Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "employees",
+          "schema": "public"
+        },
+        "columns": "manager_email, manager_name, pto_balance",
+        "where": {
+          "conditions": [{
+            "column": "email",
+            "value": "={{ $json.employeeEmail }}",
+            "condition": "equal"
+          }]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "name": "Get Employee Data",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten the (possibly array) employee lookup result and merge with the original request\nconst lookup = $json;\nconst row = Array.isArray(lookup) ? lookup[0] : lookup;\n\nif (!row || !row.manager_email) {\n  return [{\n    json: {\n      ...$('Parse Request').item.json,\n      employeeFound: false\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...$('Parse Request').item.json,\n    employeeFound: true,\n    managerEmail: row.manager_email,\n    managerName: row.manager_name,\n    ptoBalance: row.pto_balance\n  }\n}];"
+      },
+      "name": "Merge Employee Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "id": "employee-found",
+              "leftValue": "={{ $json.employeeFound }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            },
+            {
+              "id": "has-pto",
+              "leftValue": "={{ $json.ptoBalance }}",
+              "rightValue": "={{ $json.totalDays }}",
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Check PTO Balance",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "insert",
+        "table": {
+          "table": "leave_requests",
+          "schema": "public"
+        },
+        "columns": "request_id, employee_name, employee_email, manager_email, leave_type, start_date, end_date, total_days, reason, status, escalated, submitted_at",
+        "values": "={{ [[$json.requestId, $json.employeeName, $json.employeeEmail, $json.managerEmail, $json.leaveType, $json.startDate, $json.endDate, $json.totalDays, $json.reason, 'Pending', false, new Date().toISOString()]] }}"
+      },
+      "name": "Log Request",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1300, 200],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "hr-system@company.com",
+        "toEmail": "={{ $json.managerEmail }}",
+        "subject": "Leave Request: {{ $json.employeeName }}",
+        "html": "<h2>Leave Request Pending Approval</h2><p><strong>Employee:</strong> {{ $json.employeeName }}<br><strong>Type:</strong> {{ $json.leaveType }}<br><strong>Dates:</strong> {{ $json.startDate }} to {{ $json.endDate }}<br><strong>Days:</strong> {{ $json.totalDays }}<br><strong>Reason:</strong> {{ $json.reason }}<br><strong>PTO Balance:</strong> {{ $json.ptoBalance }} days</p><p><a href='https://n8n.company.com/webhook/leave-approve?req={{ $json.requestId }}&action=approve'>✅ Approve</a> | <a href='https://n8n.company.com/webhook/leave-approve?req={{ $json.requestId }}&action=reject'>❌ Reject</a></p>",
+        "options": {}
+      },
+      "name": "Send to Manager",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1550, 200],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "hr@company.com",
+        "toEmail": "={{ $json.employeeEmail }}",
+        "subject": "Leave Request Could Not Be Processed",
+        "html": "<h2>Hi {{ $json.employeeName }},</h2><p>Your leave request for {{ $json.totalDays }} days could not be approved automatically.</p><p>Reason: {{ $json.employeeFound ? 'Insufficient PTO balance (Current: ' + $json.ptoBalance + ' days)' : 'We could not find your employee record. Please contact HR.' }}</p><p>Contact HR for assistance.</p>",
+        "options": {}
+      },
+      "name": "Notify Cannot Process",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1300, 450],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{
+            "field": "hours",
+            "hoursInterval": 24
+          }]
+        },
+        "options": {}
+      },
+      "name": "Daily Escalation Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 700]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "leave_requests",
+          "schema": "public"
+        },
+        "where": {
+          "conditions": [
+            { "column": "status", "value": "Pending", "condition": "equal" },
+            { "column": "escalated", "value": "false", "condition": "equal" },
+            { "column": "submitted_at", "value": "now() - interval '48 hours'", "condition": "lessThan" }
+          ]
+        }
+      },
+      "name": "Find Unescalated Pending Approvals",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [450, 700],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "hr@company.com",
+        "toEmail": "={{ $json.manager_email }}",
+        "subject": "URGENT: Leave Request Awaiting Approval",
+        "html": "<h2>Follow-up Required</h2><p>Leave request from {{ $json.employee_name }} has been pending for 48+ hours.</p><p>Request ID: {{ $json.request_id }}</p><p><a href='https://n8n.company.com/webhook/leave-approve?req={{ $json.request_id }}&action=approve'>✅ Approve</a> | <a href='https://n8n.company.com/webhook/leave-approve?req={{ $json.request_id }}&action=reject'>❌ Reject</a></p>",
+        "options": {}
+      },
+      "name": "Escalation Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [650, 700],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "update",
+        "table": {
+          "table": "leave_requests",
+          "schema": "public"
+        },
+        "columns": "escalated",
+        "values": "true",
+        "where": {
+          "conditions": [{
+            "column": "request_id",
+            "value": "={{ $json.request_id }}"
+          }]
+        }
+      },
+      "name": "Mark Escalated",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [850, 700],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "leave-approve",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Approval Action Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 950],
+      "webhookId": "leave-approve"
+    },
+    {
+      "parameters": {
+        "jsCode": "const query = $input.first().json.query || {};\nreturn [{\n  json: {\n    requestId: query.req,\n    action: query.action === 'approve' ? 'Approved' : 'Rejected'\n  }\n}];"
+      },
+      "name": "Parse Approval Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 950]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "update",
+        "table": {
+          "table": "leave_requests",
+          "schema": "public"
+        },
+        "columns": "status",
+        "values": "={{ $json.action }}",
+        "where": {
+          "conditions": [{
+            "column": "request_id",
+            "value": "={{ $json.requestId }}"
+          }]
+        }
+      },
+      "name": "Update Request Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [650, 950],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "HR Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "=Request {{ $json.requestId }} marked as {{ $json.action }}. You can close this tab.",
+        "options": {}
+      },
+      "name": "Approval Confirmation",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [850, 950]
+    }
+  ],
+  "connections": {
+    "Leave Form Submission": {
+      "main": [[{"node": "Parse Request", "type": "main", "index": 0}]]
+    },
+    "Parse Request": {
+      "main": [[{"node": "Get Employee Data", "type": "main", "index": 0}]]
+    },
+    "Get Employee Data": {
+      "main": [[{"node": "Merge Employee Data", "type": "main", "index": 0}]]
+    },
+    "Merge Employee Data": {
+      "main": [[{"node": "Check PTO Balance", "type": "main", "index": 0}]]
+    },
+    "Check PTO Balance": {
+      "main": [
+        [{"node": "Log Request", "type": "main", "index": 0}],
+        [{"node": "Notify Cannot Process", "type": "main", "index": 0}]
+      ]
+    },
+    "Log Request": {
+      "main": [[{"node": "Send to Manager", "type": "main", "index": 0}]]
+    },
+    "Daily Escalation Check": {
+      "main": [[{"node": "Find Unescalated Pending Approvals", "type": "main", "index": 0}]]
+    },
+    "Find Unescalated Pending Approvals": {
+      "main": [[{"node": "Escalation Email", "type": "main", "index": 0}]]
+    },
+    "Escalation Email": {
+      "main": [[{"node": "Mark Escalated", "type": "main", "index": 0}]]
+    },
+    "Approval Action Webhook": {
+      "main": [[{"node": "Parse Approval Action", "type": "main", "index": 0}]]
+    },
+    "Parse Approval Action": {
+      "main": [[{"node": "Update Request Status", "type": "main", "index": 0}]]
+    },
+    "Update Request Status": {
+      "main": [[{"node": "Approval Confirmation", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

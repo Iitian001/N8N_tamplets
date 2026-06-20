@@ -1,0 +1,279 @@
+{
+  "name": "Lead Auto-Capture Pipeline",
+  "tags": ["sales", "leads", "crm", "webhook"],
+  "description": "Captures leads from website forms, validates data, creates CRM records, sends notifications, and triggers follow-up emails. Single response path, retry-safe CRM/email calls, and clear error routing.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Lead Auto-Capture Pipeline\n**What this does:**\n1. Receives form submissions via webhook\n2. Validates required fields (name, email)\n3. Upserts contact in Salesforce\n4. Sends Slack notification + welcome email\n5. Flags high-value leads (has company) for manager alert\n6. Always responds to the webhook exactly once\n\n**Setup required:**\n- Salesforce OAuth2 credential\n- Slack credential (channels: #leads, #sales-alerts)\n- SendGrid credential + verified sender domain\n- Point your website form to: `/webhook/lead-capture`",
+        "height": 380,
+        "width": 380
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -120]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-capture",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "name": "Website Form Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "lead-capture"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate lead data and normalize fields\nconst body = $input.first().json.body || $input.first().json;\nconst errors = [];\n\nconst email = (body.email || '').trim();\nconst name = (body.name || '').trim();\n\nconst emailRegex = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nif (!name) errors.push('Missing name');\nif (!email) errors.push('Missing email');\nelse if (!emailRegex.test(email)) errors.push('Invalid email format');\n\nif (errors.length > 0) {\n  return [{\n    json: {\n      isValid: false,\n      errors,\n      raw: body\n    }\n  }];\n}\n\nconst nameParts = name.split(' ');\n\nreturn [{\n  json: {\n    isValid: true,\n    name,\n    email: email.toLowerCase(),\n    firstName: body.firstName || nameParts[0] || '',\n    lastName: body.lastName || nameParts.slice(1).join(' ') || '',\n    company: (body.company || '').trim(),\n    phone: (body.phone || '').trim(),\n    message: (body.message || '').trim(),\n    url: body.url || '',\n    submittedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "name": "Validate Lead Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "valid-lead",
+              "leftValue": "={{ $json.isValid }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Check Valid Email",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "data": {
+          "Email": "={{ $json.email }}",
+          "FirstName": "={{ $json.firstName }}",
+          "LastName": "={{ $json.lastName }}",
+          "Company": "={{ $json.company }}",
+          "Phone": "={{ $json.phone }}",
+          "LeadSource": "Website Form",
+          "Lead_Status__c": "New"
+        },
+        "externalId": "=email",
+        "externalIdValue": "={{ $json.email }}"
+      },
+      "name": "Create/Update in Salesforce",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 1,
+      "position": [900, 200],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Salesforce Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "#leads",
+        "text": "🎉 New Lead Captured!\n\n*Name:* {{ $json.name }}\n*Email:* {{ $json.email }}\n*Company:* {{ $json.company || 'N/A' }}\n*Phone:* {{ $json.phone || 'N/A' }}\n\n<{{ $json.url || '#' }}|View source page>",
+        "options": {}
+      },
+      "name": "Send Slack Notification",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1150, 100],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "sales@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "Welcome! We received your inquiry",
+        "html": "<!DOCTYPE html>\n<html>\n<body style=\"font-family: Arial, sans-serif; line-height: 1.6;\">\n  <h2>Hi {{ $json.name }},</h2>\n  <p>Thank you for reaching out to us! We've received your inquiry and our team will get back to you within 24 hours.</p>\n  <p>Here's what you shared with us:</p>\n  <ul>\n    <li><strong>Company:</strong> {{ $json.company || 'Not provided' }}</li>\n    <li><strong>Message:</strong> {{ $json.message || 'N/A' }}</li>\n  </ul>\n  <p>Best regards,<br/>The Sales Team</p>\n</body>\n</html>",
+        "options": {}
+      },
+      "name": "Send Welcome Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1150, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "high-value",
+              "leftValue": "={{ $json.company }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "High-Value Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1400, 300]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-alerts",
+        "text": "🔥 HOT LEAD ALERT! 🔥\n\nHigh-value lead from {{ $json.company }}!\n*Contact:* {{ $json.name }} ({{ $json.email }})\n*Phone:* {{ $json.phone || 'N/A' }}\n\nAction needed ASAP!",
+        "options": {}
+      },
+      "name": "Alert Sales Manager",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [1650, 200],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: true, message: \"Thank you! We'll be in touch soon.\" } }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1900, 250]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, errors: $json.errors } }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "name": "Validation Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 450]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: false, message: \"We received your info but hit a snag saving it. Our team has been notified.\" } }}",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "name": "CRM Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [900, 600]
+    },
+    {
+      "parameters": {
+        "channel": "#sales-alerts",
+        "text": "⚠️ CRM sync failed for a new lead.\n*Name:* {{ $json.name }}\n*Email:* {{ $json.email }}\n\nThe lead was NOT saved to Salesforce — please add manually.",
+        "options": {}
+      },
+      "name": "Alert CRM Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [700, 600],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Website Form Webhook": {
+      "main": [[{"node": "Validate Lead Data", "type": "main", "index": 0}]]
+    },
+    "Validate Lead Data": {
+      "main": [[{"node": "Check Valid Email", "type": "main", "index": 0}]]
+    },
+    "Check Valid Email": {
+      "main": [
+        [{"node": "Create/Update in Salesforce", "type": "main", "index": 0}],
+        [{"node": "Validation Error Response", "type": "main", "index": 0}]
+      ]
+    },
+    "Create/Update in Salesforce": {
+      "main": [
+        [{"node": "Send Slack Notification", "type": "main", "index": 0}, {"node": "Send Welcome Email", "type": "main", "index": 0}],
+        [{"node": "Alert CRM Failure", "type": "main", "index": 0}]
+      ]
+    },
+    "Alert CRM Failure": {
+      "main": [[{"node": "CRM Error Response", "type": "main", "index": 0}]]
+    },
+    "Send Welcome Email": {
+      "main": [[{"node": "High-Value Lead?", "type": "main", "index": 0}]]
+    },
+    "High-Value Lead?": {
+      "main": [
+        [{"node": "Alert Sales Manager", "type": "main", "index": 0}],
+        [{"node": "Success Response", "type": "main", "index": 0}]
+      ]
+    },
+    "Alert Sales Manager": {
+      "main": [[{"node": "Success Response", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

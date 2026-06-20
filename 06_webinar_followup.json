@@ -1,0 +1,236 @@
+{
+  "name": "Webinar Follow-up Automation",
+  "tags": ["webinar", "email", "follow-up", "marketing", "engagement"],
+  "description": "Automated multi-stage follow-up emails after a webinar: immediate thank you, day-3 replay, then day-14 split by engagement (full attendees get an offer, partial attendees get resources). All waits are sequential so timing is accurate per attendee.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Webinar Follow-up Sequence\n**Timeline per attendee:**\n- Day 0: Thank-you email (immediately)\n- Day 3: Replay email (after a 3-day wait)\n- Day 14: Either a special offer (if they watched ≥45 min) or a resources email (if not) — after an 11-day wait from day 3, so 14 days total from the webinar\n\n**Fix from original:** the engagement-based branch used to fire off the *original* webinar-end trigger in parallel with the day-3/7 chain, so the day-14 emails went out immediately instead of after 14 days. This version runs everything as one sequential chain per attendee.\n\n**Setup required:** webhook from your webinar platform on `webinar.ended`, SendGrid credentials.",
+        "height": 360,
+        "width": 380
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -120]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "webinar-end",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "name": "Webinar Ended Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300],
+      "webhookId": "webinar-end"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json.body || $input.first().json;\nconst attendees = data.attendees || [];\n\nif (!attendees.length) {\n  return [{ json: { noAttendees: true } }];\n}\n\nreturn attendees\n  .filter(a => a && a.email)\n  .map(a => ({\n    json: {\n      email: a.email,\n      name: a.name || 'there',\n      attendedDuration: a.duration_minutes || 0,\n      webinarTitle: data.webinar_title || 'our webinar',\n      replayUrl: data.replay_url || '#',\n      complete: (a.duration_minutes || 0) >= 45\n    }\n  }));"
+      },
+      "name": "Parse Attendees",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-attendees",
+              "leftValue": "={{ $json.noAttendees }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEqual"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Has Attendees?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "webinars@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "🎉 Thanks for attending: {{ $json.webinarTitle }}",
+        "html": "<h2>Hi {{ $json.name }},</h2><p>Thanks for joining our webinar <strong>{{ $json.webinarTitle }}</strong>!</p><p>Your attendance: {{ $json.attendedDuration }} minutes</p><p>Watch the replay: <a href='{{ $json.replayUrl }}'>Click here</a></p><p>We'll send you more resources soon!</p>",
+        "options": {}
+      },
+      "name": "Send Thank You Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "unit": "days",
+        "amount": 3,
+        "options": {}
+      },
+      "name": "Wait 3 Days",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1150, 300],
+      "webhookId": "webinar-wait-3day"
+    },
+    {
+      "parameters": {
+        "fromEmail": "webinars@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "📹 Webinar Replay & Key Takeaways",
+        "html": "<h2>Hi {{ $json.name }},</h2><p>Missed something? Here's the replay of <strong>{{ $json.webinarTitle }}</strong>:</p><p><a href='{{ $json.replayUrl }}' style='padding:12px 24px;background:#007bff;color:white;text-decoration:none;border-radius:4px;'>Watch Replay</a></p><p>Key takeaways attached!</p>",
+        "options": {}
+      },
+      "name": "Send Replay Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1400, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "unit": "days",
+        "amount": 11,
+        "options": {}
+      },
+      "name": "Wait 11 More Days (Day 14 Total)",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "webhookId": "webinar-wait-14day"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [{
+            "id": "watched-full",
+            "leftValue": "={{ $json.complete }}",
+            "rightValue": true,
+            "operator": {
+              "type": "boolean",
+              "operation": "equal"
+            }
+          }]
+        }
+      },
+      "name": "Watched Full Webinar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1900, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "webinars@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "🎁 Exclusive Offer for Engaged Viewers",
+        "html": "<h2>Hi {{ $json.name }},</h2><p>You watched the entire webinar - impressive!</p><p>Here's an exclusive 20% discount code: <strong>ENGAGED20</strong></p><p><a href='https://yourcompany.com/offer'>Claim Your Offer</a></p>",
+        "options": {}
+      },
+      "name": "Send Special Offer",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [2150, 200],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "webinars@yourcompany.com",
+        "toEmail": "={{ $json.email }}",
+        "subject": "📚 Resources from {{ $json.webinarTitle }}",
+        "html": "<h2>Hi {{ $json.name }},</h2><p>Here are the resources mentioned in the webinar:</p><ul><li><a href='#'>Download Guide PDF</a></li><li><a href='#'>Checklist Template</a></li><li><a href='#'>Case Study</a></li></ul>",
+        "options": {}
+      },
+      "name": "Send Resources Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [2150, 400],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webinar Ended Trigger": {
+      "main": [[{"node": "Parse Attendees", "type": "main", "index": 0}]]
+    },
+    "Parse Attendees": {
+      "main": [[{"node": "Has Attendees?", "type": "main", "index": 0}]]
+    },
+    "Has Attendees?": {
+      "main": [
+        [{"node": "Send Thank You Email", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Send Thank You Email": {
+      "main": [[{"node": "Wait 3 Days", "type": "main", "index": 0}]]
+    },
+    "Wait 3 Days": {
+      "main": [[{"node": "Send Replay Email", "type": "main", "index": 0}]]
+    },
+    "Send Replay Email": {
+      "main": [[{"node": "Wait 11 More Days (Day 14 Total)", "type": "main", "index": 0}]]
+    },
+    "Wait 11 More Days (Day 14 Total)": {
+      "main": [[{"node": "Watched Full Webinar?", "type": "main", "index": 0}]]
+    },
+    "Watched Full Webinar?": {
+      "main": [
+        [{"node": "Send Special Offer", "type": "main", "index": 0}],
+        [{"node": "Send Resources Email", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

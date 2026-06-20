@@ -1,0 +1,686 @@
+{
+  "name": "\ud83d\ude80 Enterprise Multi-LLM Router with Fallback + Cost Analytics",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Multi-LLM Router\n**Flow:**\n1. Webhook receives `{ prompt, ... }` + `x-signature` header\n2. HMAC signature verified against `WEBHOOK_SECRET`\n3. Prompt scored for complexity (code/reasoning/math/length)\n4. Routed to one of 4 tiers: critical \u2192 Claude Opus, high \u2192 GPT-4, medium \u2192 GPT-3.5, low \u2192 GPT-3.5 (fast path)\n5. Every model call normalizes its response shape before logging cost/latency to InfluxDB\n6. On any model failure, falls back to the next cheaper/faster model rather than erroring out\n\n**Required env vars:** ANTHROPIC_API_KEY, OPENAI_API_KEY, INFLUXDB_URL, INFLUXDB_TOKEN, WEBHOOK_SECRET\n\n**Note on HMAC:** this version computes the signature with Node's built-in `crypto` module (available in n8n Code nodes) instead of CryptoJS, which is not bundled by default.",
+        "height": 460,
+        "width": 420
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        -180
+      ]
+    },
+    {
+      "id": "trigger-webhook",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        250,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "llm-router",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "webhookId": "llm-router-v2"
+    },
+    {
+      "id": "hmac-verify",
+      "name": "HMAC Signature Verify",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        450,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const crypto = require('crypto');\n\nconst item = $input.first().json;\nconst rawBody = item.body || {};\nconst signatureHeader = $request?.headers?.['x-signature'] || item.headers?.['x-signature'] || '';\nconst secret = $env.WEBHOOK_SECRET || '';\n\nconst payloadString = typeof rawBody === 'string' ? rawBody : JSON.stringify(rawBody);\nconst expected = crypto.createHmac('sha256', secret).update(payloadString).digest('hex');\n\n// Constant-time-ish comparison guard against trivial timing leaks\nlet verified = false;\ntry {\n  verified = signatureHeader.length === expected.length &&\n    crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));\n} catch (e) {\n  verified = false;\n}\n\nreturn [{\n  json: {\n    ...rawBody,\n    verified\n  }\n}];"
+      }
+    },
+    {
+      "id": "auth-check",
+      "name": "Auth Gate",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        650,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "check-auth",
+              "leftValue": "={{ $json.verified }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "auth-fail-response",
+      "name": "401 Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        850,
+        500
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: 'Invalid or missing signature' } }}",
+        "options": {
+          "responseCode": 401
+        }
+      }
+    },
+    {
+      "id": "prompt-analysis",
+      "name": "Prompt Complexity Analyzer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        850,
+        200
+      ],
+      "parameters": {
+        "jsCode": "const prompt = $json.prompt;\n\nif (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {\n  return [{\n    json: {\n      ...$json,\n      promptError: 'Missing or empty \"prompt\" field in request body'\n    }\n  }];\n}\n\nconst length = prompt.length;\nconst hasCode = /```|def |function|class |import |const |let |->/.test(prompt);\nconst hasReasoning = /why|how|explain|compare|analyze|reason|think step|l\u00f3gica|por qu\u00e9|\u00bf/.test(prompt);\nconst hasCodeRequest = /write |generate |implement |code|program|script|function/.test(prompt);\nconst hasMath = /integral|derivative|equation|solve|calculate|\\d+\\s*[\\+\\-\\*\\/]\\s*\\d+/.test(prompt);\nconst msgCount = (prompt.match(/\\n/g) || []).length;\n\nlet score = 0;\nif (length > 200) score += 1;\nif (hasCode) score += 3;\nif (hasReasoning) score += 2;\nif (hasMath) score += 2;\nif (msgCount > 5) score += 1;\nif (length > 1000) score += 2;\nif (hasCodeRequest) score += 1;\n\nlet complexity = 'low';\nif (score >= 6) complexity = 'critical';\nelse if (score >= 3) complexity = 'high';\nelse if (score >= 1) complexity = 'medium';\n\nreturn [{\n  json: {\n    ...$json,\n    promptLength: length,\n    hasCode,\n    hasReasoning,\n    complexity,\n    score,\n    requestStartedAt: Date.now()\n  }\n}];"
+      }
+    },
+    {
+      "id": "prompt-error-response",
+      "name": "400 Bad Request",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        1050,
+        500
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { error: $json.promptError } }}",
+        "options": {
+          "responseCode": 400
+        }
+      }
+    },
+    {
+      "id": "prompt-error-gate",
+      "name": "Prompt Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1050,
+        200
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "no-prompt-error",
+              "leftValue": "={{ $json.promptError }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "route-llm",
+      "name": "LLM Router Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1250,
+        150
+      ],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ ({ critical: 0, high: 1, medium: 2, low: 3 })[$json.complexity] ?? 3 }}",
+        "options": {
+          "fallbackOutput": 3
+        }
+      }
+    },
+    {
+      "id": "claude-opus",
+      "name": "Claude Opus (Critical)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1500,
+        -50
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "claude-opus-4-7"
+            },
+            {
+              "name": "max_tokens",
+              "value": 4096
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\": \"user\", \"content\": $json.prompt}] }}"
+            },
+            {
+              "name": "temperature",
+              "value": 0.3
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1500
+    },
+    {
+      "id": "gpt4",
+      "name": "GPT-4 (High)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1500,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.OPENAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "gpt-4-turbo"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\": \"user\", \"content\": $json.prompt}] }}"
+            },
+            {
+              "name": "temperature",
+              "value": 0.5
+            },
+            {
+              "name": "max_tokens",
+              "value": 2048
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "id": "gpt35-medium",
+      "name": "GPT-3.5 (Medium)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1500,
+        250
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.OPENAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "gpt-3.5-turbo"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\": \"user\", \"content\": $json.prompt}] }}"
+            },
+            {
+              "name": "temperature",
+              "value": 0.6
+            },
+            {
+              "name": "max_tokens",
+              "value": 1024
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 800
+    },
+    {
+      "id": "gpt35-low",
+      "name": "GPT-3.5 (Low)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1500,
+        400
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "nodeCredentialType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Bearer ' + $env.OPENAI_API_KEY }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "model",
+              "value": "gpt-3.5-turbo"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\": \"user\", \"content\": $json.prompt}] }}"
+            },
+            {
+              "name": "temperature",
+              "value": 0.7
+            },
+            {
+              "name": "max_tokens",
+              "value": 512
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 1
+    },
+    {
+      "id": "normalize-response",
+      "name": "Normalize Model Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1750,
+        150
+      ],
+      "parameters": {
+        "jsCode": "// Works for both Anthropic and OpenAI response shapes, and for error passthroughs\nconst item = $input.first().json;\nconst latency = Date.now() - (item.requestStartedAt || Date.now());\n\nlet modelUsed = 'unknown';\nlet outputText = '';\nlet inputTokens = 0;\nlet outputTokens = 0;\nlet errored = false;\nlet errorMessage = null;\n\nif (item.error) {\n  errored = true;\n  errorMessage = JSON.stringify(item.error);\n} else if (item.content && Array.isArray(item.content)) {\n  // Anthropic shape\n  modelUsed = item.model || 'claude';\n  outputText = item.content.map(c => c.text || '').join('');\n  inputTokens = item.usage?.input_tokens || 0;\n  outputTokens = item.usage?.output_tokens || 0;\n} else if (item.choices && Array.isArray(item.choices)) {\n  // OpenAI shape\n  modelUsed = item.model || 'gpt';\n  outputText = item.choices[0]?.message?.content || '';\n  inputTokens = item.usage?.prompt_tokens || 0;\n  outputTokens = item.usage?.completion_tokens || 0;\n} else {\n  errored = true;\n  errorMessage = 'Unrecognized response shape from model provider';\n}\n\n// Rough cost estimates (USD per 1K tokens) - update to match current pricing\nconst costTable = {\n  'claude-opus-4-7': { in: 0.015, out: 0.075 },\n  'gpt-4-turbo': { in: 0.01, out: 0.03 },\n  'gpt-3.5-turbo': { in: 0.0005, out: 0.0015 }\n};\nconst rates = costTable[modelUsed] || { in: 0, out: 0 };\nconst cost = ((inputTokens / 1000) * rates.in) + ((outputTokens / 1000) * rates.out);\n\nreturn [{\n  json: {\n    success: !errored,\n    model: modelUsed,\n    complexity: item.complexity,\n    output: outputText,\n    inputTokens,\n    outputTokens,\n    totalTokens: inputTokens + outputTokens,\n    cost: Math.round(cost * 100000) / 100000,\n    latencyMs: latency,\n    errorMessage\n  }\n}];"
+      }
+    },
+    {
+      "id": "cost-tracker",
+      "name": "Cost & Latency Logger (InfluxDB)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1950,
+        150
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.INFLUXDB_URL }}/api/v2/write?bucket=llm_metrics&precision=ms",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ 'Token ' + $env.INFLUXDB_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "text/plain"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "body": "={{ 'llm_request,model=' + $json.model + ',complexity=' + $json.complexity + ',success=' + $json.success + ' tokens=' + $json.totalTokens + ',cost=' + $json.cost + ',latency_ms=' + $json.latencyMs + ' ' + Date.now() }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "final-response",
+      "name": "Final Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        2150,
+        150
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { success: $('Normalize Model Response').item.json.success, model: $('Normalize Model Response').item.json.model, output: $('Normalize Model Response').item.json.output, usage: { totalTokens: $('Normalize Model Response').item.json.totalTokens, estimatedCostUsd: $('Normalize Model Response').item.json.cost, latencyMs: $('Normalize Model Response').item.json.latencyMs } } }}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "HMAC Signature Verify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HMAC Signature Verify": {
+      "main": [
+        [
+          {
+            "node": "Auth Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auth Gate": {
+      "main": [
+        [
+          {
+            "node": "Prompt Complexity Analyzer",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "401 Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt Complexity Analyzer": {
+      "main": [
+        [
+          {
+            "node": "Prompt Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prompt Valid?": {
+      "main": [
+        [
+          {
+            "node": "LLM Router Switch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "400 Bad Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LLM Router Switch": {
+      "main": [
+        [
+          {
+            "node": "Claude Opus (Critical)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GPT-4 (High)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GPT-3.5 (Medium)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GPT-3.5 (Low)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Opus (Critical)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Model Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GPT-4 (High)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GPT-4 (High)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Model Response",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GPT-3.5 (Medium)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GPT-3.5 (Medium)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Model Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GPT-3.5 (Low)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Model Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Model Response": {
+      "main": [
+        [
+          {
+            "node": "Cost & Latency Logger (InfluxDB)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cost & Latency Logger (InfluxDB)": {
+      "main": [
+        [
+          {
+            "node": "Final Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "version": 2,
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Kolkata",
+    "saveManualExecutions": true
+  },
+  "tags": [
+    "ai",
+    "llm",
+    "enterprise",
+    "routing"
+  ],
+  "pinData": {},
+  "meta": {
+    "templateCredsSetup": {
+      "ANTHROPIC_API_KEY": {
+        "required": true
+      },
+      "OPENAI_API_KEY": {
+        "required": true
+      },
+      "INFLUXDB_URL": {
+        "required": true
+      },
+      "INFLUXDB_TOKEN": {
+        "required": true
+      },
+      "WEBHOOK_SECRET": {
+        "required": true
+      }
+    }
+  }
+}

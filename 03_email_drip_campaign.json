@@ -1,0 +1,403 @@
+{
+  "name": "Email Drip Campaign Automation",
+  "tags": ["marketing", "email", "drip-campaign", "automation"],
+  "description": "Automated drip email campaigns with engagement tracking, dynamic content, and analytics logging. Routes contacts to the correct template based on actual days-since-last-email, with engagement scoring that always logs to analytics.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Email Drip Campaign\n**Flow:**\n1. Daily trigger pulls qualified, opted-in contacts from Salesforce\n2. Computes days since last email per contact\n3. Routes to day-0 / day-3 / day-7+ template based on that count\n4. Sends templated email, updates Salesforce send count\n5. Separately checks Airtable for opens in the last 24h and scores engagement\n6. Every contact gets logged to the Google Sheets analytics tab, opened or not\n\n**Setup required:** Salesforce, Postgres (email_templates table), SendGrid, Airtable (email_opens table), Google Sheets credentials.",
+        "height": 360,
+        "width": 380
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -100]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "name": "Daily Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "getAll",
+        "limit": 100,
+        "options": {
+          "conditions": {
+            "Email_Opt_In__c": true,
+            "Lead_Status__c": "Qualified"
+          }
+        }
+      },
+      "name": "Get Qualified Contacts",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 1,
+      "position": [450, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Salesforce Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Enrich contact data and compute campaign day\nconst contacts = $input.all().map(i => i.json);\n\nreturn contacts\n  .filter(c => c && c.Email)\n  .map(contact => {\n    const daysSinceLast = contact.Last_Email_Sent__c\n      ? Math.floor((Date.now() - new Date(contact.Last_Email_Sent__c).getTime()) / (1000 * 60 * 60 * 24))\n      : 0;\n\n    // Bucket into the nearest defined campaign step\n    let campaignDay = 0;\n    if (daysSinceLast >= 7) campaignDay = 7;\n    else if (daysSinceLast >= 3) campaignDay = 3;\n    else campaignDay = 0;\n\n    return {\n      json: {\n        ...contact,\n        daysSinceLast,\n        campaignDay,\n        emailSequence: contact.Email_Sequence__c || 'welcome_series'\n      }\n    };\n  });"
+      },
+      "name": "Enrich Contact Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "dataType": "number",
+        "value1": "={{ $json.campaignDay }}",
+        "rules": [
+          { "value2": 0, "output": 0 },
+          { "value2": 3, "output": 1 },
+          { "value2": 7, "output": 2 }
+        ],
+        "fallbackOutput": 2
+      },
+      "name": "Route by Campaign Day",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "email_templates",
+          "schema": "public"
+        },
+        "columns": "subject, html_content, text_content",
+        "where": {
+          "conditions": [{
+            "column": "sequence_name",
+            "value": "={{ $json.emailSequence }}",
+            "condition": "equal"
+          }, {
+            "column": "day_number",
+            "value": "0",
+            "condition": "equal"
+          }]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "name": "Get Day 0 Template",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 100],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Postgres Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "email_templates",
+          "schema": "public"
+        },
+        "columns": "subject, html_content, text_content",
+        "where": {
+          "conditions": [{
+            "column": "sequence_name",
+            "value": "={{ $json.emailSequence }}",
+            "condition": "equal"
+          }, {
+            "column": "day_number",
+            "value": "3",
+            "condition": "equal"
+          }]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "name": "Get Day 3 Template",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 300],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Postgres Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "database",
+        "operation": "select",
+        "table": {
+          "table": "email_templates",
+          "schema": "public"
+        },
+        "columns": "subject, html_content, text_content",
+        "where": {
+          "conditions": [{
+            "column": "sequence_name",
+            "value": "={{ $json.emailSequence }}",
+            "condition": "equal"
+          }, {
+            "column": "day_number",
+            "value": "7",
+            "condition": "equal"
+          }]
+        },
+        "options": {
+          "queryBatching": "single"
+        }
+      },
+      "name": "Get Day 7+ Template",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 500],
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Postgres Database"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge template result (array from Postgres) into the contact item and render placeholders\nconst contact = $input.first().json;\nconst template = Array.isArray(contact) ? contact[0] : (contact.subject ? contact : null);\n\n// Postgres node usually returns the row directly as json when queryBatching=single\nconst row = contact.subject ? contact : ($input.first().json[0] || {});\n\nconst firstName = $('Enrich Contact Data').item.json.FirstName || '';\nconst company = $('Enrich Contact Data').item.json.Company || '';\n\nconst renderedHtml = (row.html_content || '').split('{{first_name}}').join(firstName).split('{{company}}').join(company);\nconst renderedText = (row.text_content || '').split('{{first_name}}').join(firstName).split('{{company}}').join(company);\n\nreturn [{\n  json: {\n    ...$('Enrich Contact Data').item.json,\n    templateSubject: row.subject || 'Following up',\n    templateHtml: renderedHtml,\n    templateText: renderedText\n  }\n}];"
+      },
+      "name": "Render Template",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "fromEmail": "marketing@yourcompany.com",
+        "toEmail": "={{ $json.Email }}",
+        "subject": "={{ $json.templateSubject }}",
+        "html": "={{ $json.templateHtml }}",
+        "text": "={{ $json.templateText }}",
+        "options": {
+          "categories": ["drip-campaign", "welcome-series"]
+        }
+      },
+      "name": "Send Drip Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1450, 300],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "contactId": "={{ $json.Id }}",
+        "updateFields": {
+          "Last_Email_Sent__c": "={{ $now.toISO() }}",
+          "Email_Sent_Count__c": "={{ ($json.Email_Sent_Count__c || 0) + 1 }}"
+        }
+      },
+      "name": "Update Contact Record",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Salesforce Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "base",
+        "operation": "list",
+        "table": "email_opens",
+        "options": {
+          "filterByFormula": "AND({email_address} = '{{ $json.Email }}', DATETIME_DIFF(NOW(), {created_time}, 'hours') < 24)"
+        }
+      },
+      "name": "Check Email Opens",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Airtable Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "opened",
+              "leftValue": "={{ ($json.records || []).length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Email Opened?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2050, 300]
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "update",
+        "contactId": "={{ $('Render Template').item.json.Id }}",
+        "updateFields": {
+          "Email_Engagement_Score__c": "={{ Math.min(($('Render Template').item.json.Email_Engagement_Score__c || 0) + 10, 100) }}",
+          "Last_Engagement_Date__c": "={{ $now.toISO() }}"
+        }
+      },
+      "name": "Update Engagement Score",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 1,
+      "position": [2250, 200],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Salesforce Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": "email_analytics",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "email_address": "={{ $('Render Template').item.json.Email }}",
+            "campaign_name": "={{ $('Render Template').item.json.emailSequence }}",
+            "email_sent_at": "={{ $now.toISO() }}",
+            "opened": "={{ ($json.records || []).length > 0 }}"
+          }
+        },
+        "options": {}
+      },
+      "name": "Log to Analytics",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4,
+      "position": [2450, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Sheets Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily Trigger": {
+      "main": [[{"node": "Get Qualified Contacts", "type": "main", "index": 0}]]
+    },
+    "Get Qualified Contacts": {
+      "main": [[{"node": "Enrich Contact Data", "type": "main", "index": 0}]]
+    },
+    "Enrich Contact Data": {
+      "main": [[{"node": "Route by Campaign Day", "type": "main", "index": 0}]]
+    },
+    "Route by Campaign Day": {
+      "main": [
+        [{"node": "Get Day 0 Template", "type": "main", "index": 0}],
+        [{"node": "Get Day 3 Template", "type": "main", "index": 0}],
+        [{"node": "Get Day 7+ Template", "type": "main", "index": 0}]
+      ]
+    },
+    "Get Day 0 Template": {
+      "main": [[{"node": "Render Template", "type": "main", "index": 0}]]
+    },
+    "Get Day 3 Template": {
+      "main": [[{"node": "Render Template", "type": "main", "index": 0}]]
+    },
+    "Get Day 7+ Template": {
+      "main": [[{"node": "Render Template", "type": "main", "index": 0}]]
+    },
+    "Render Template": {
+      "main": [[{"node": "Send Drip Email", "type": "main", "index": 0}]]
+    },
+    "Send Drip Email": {
+      "main": [[{"node": "Update Contact Record", "type": "main", "index": 0}]]
+    },
+    "Update Contact Record": {
+      "main": [[{"node": "Check Email Opens", "type": "main", "index": 0}]]
+    },
+    "Check Email Opens": {
+      "main": [[{"node": "Email Opened?", "type": "main", "index": 0}]]
+    },
+    "Email Opened?": {
+      "main": [
+        [{"node": "Update Engagement Score", "type": "main", "index": 0}, {"node": "Log to Analytics", "type": "main", "index": 0}],
+        [{"node": "Log to Analytics", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}

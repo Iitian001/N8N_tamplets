@@ -1,0 +1,196 @@
+{
+  "name": "Meeting Scheduler Automation",
+  "tags": ["meetings", "scheduling", "calendar", "productivity"],
+  "description": "Automates meeting scheduling with Calendly, sends confirmations, creates calendar events, and notifies team via Slack and CRM logging.",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Meeting Scheduler\n**Flow:**\n1. Calendly webhook fires on `invitee.created`\n2. Parses invitee + event details\n3. Creates a Google Calendar event (in parallel with Slack notification)\n4. Sends a confirmation email with a real calendar link (Google Calendar's `htmlLink` field, not a placeholder)\n5. Logs/upserts the invitee in Salesforce\n\n**Setup required:** Calendly webhook subscription, Google Calendar OAuth2, SendGrid, Slack, Salesforce credentials.",
+        "height": 300,
+        "width": 360
+      },
+      "name": "Sticky Note - Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [220, -80]
+    },
+    {
+      "parameters": {
+        "events": ["invitee.created"]
+      },
+      "name": "Calendly Webhook",
+      "type": "n8n-nodes-base.calendlyTrigger",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "calendly-meetings"
+    },
+    {
+      "parameters": {
+        "jsCode": "const event = $input.first().json;\nconst payload = event.payload || event;\n\nconst invitee = payload.invitee || {};\nconst eventInfo = payload.event || {};\nconst eventType = payload.event_type || {};\n\nif (!invitee.email || !eventInfo.start_time) {\n  return [{\n    json: {\n      parseError: 'Missing invitee email or event start time in Calendly payload',\n      raw: payload\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    inviteeName: invitee.name || 'Guest',\n    inviteeEmail: invitee.email,\n    eventType: eventType.name || 'Meeting',\n    startTime: eventInfo.start_time,\n    endTime: eventInfo.end_time,\n    location: eventInfo.location?.join_url || eventInfo.location || 'TBD',\n    questions: payload.questions_and_answers || []\n  }\n}];"
+      },
+      "name": "Parse Meeting Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "parsed-ok",
+              "leftValue": "={{ $json.parseError }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "name": "Parsed Successfully?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "calendar": "primary",
+        "start": "={{ $json.startTime }}",
+        "end": "={{ $json.endTime }}",
+        "additionalFields": {
+          "attendees": ["={{ $json.inviteeEmail }}"],
+          "summary": "={{ $json.eventType }} - {{ $json.inviteeName }}",
+          "description": "Meeting scheduled via Calendly.\n\nAttendee: {{ $json.inviteeName }}\nEmail: {{ $json.inviteeEmail }}\nLocation: {{ $json.location }}",
+          "location": "={{ $json.location }}"
+        }
+      },
+      "name": "Create Google Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1,
+      "position": [900, 200],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fromEmail": "meetings@yourcompany.com",
+        "toEmail": "={{ $('Parse Meeting Data').item.json.inviteeEmail }}",
+        "subject": "✅ Meeting Confirmed: {{ $('Parse Meeting Data').item.json.eventType }}",
+        "html": "<h2>Hi {{ $('Parse Meeting Data').item.json.inviteeName }},</h2><p>Your meeting is confirmed!</p><p><strong>Event:</strong> {{ $('Parse Meeting Data').item.json.eventType }}<br><strong>Date:</strong> {{ new Date($('Parse Meeting Data').item.json.startTime).toLocaleDateString() }}<br><strong>Time:</strong> {{ new Date($('Parse Meeting Data').item.json.startTime).toLocaleTimeString() }} - {{ new Date($('Parse Meeting Data').item.json.endTime).toLocaleTimeString() }}<br><strong>Location:</strong> {{ $('Parse Meeting Data').item.json.location }}</p><p>Add to your calendar: <a href='{{ $json.htmlLink || $json.link || '#' }}'>Click here</a></p>",
+        "options": {}
+      },
+      "name": "Send Confirmation Email",
+      "type": "n8n-nodes-base.sendGrid",
+      "typeVersion": 2,
+      "position": [1150, 200],
+      "onError": "continueErrorOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "sendGridApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "SendGrid Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "#meetings",
+        "text": "📅 New Meeting Scheduled\n\n*With:* {{ $json.inviteeName }}\n*Event:* {{ $json.eventType }}\n*When:* {{ $json.startTime }}\n\n✅ Calendar invite + confirmation email sent",
+        "options": {}
+      },
+      "name": "Notify Team on Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [900, 450],
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "contact",
+        "operation": "upsert",
+        "externalId": "=email",
+        "externalIdValue": "={{ $json.inviteeEmail }}",
+        "data": {
+          "Email": "={{ $json.inviteeEmail }}",
+          "FirstName": "={{ $json.inviteeName.split(' ')[0] }}",
+          "LastName": "={{ $json.inviteeName.split(' ').slice(1).join(' ') || '' }}",
+          "LeadSource": "Calendly Meeting"
+        }
+      },
+      "name": "Log to CRM",
+      "type": "n8n-nodes-base.salesforce",
+      "typeVersion": 1,
+      "position": [1400, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "credentials": {
+        "salesforceOAuth2Api": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Salesforce Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "channel": "#meetings",
+        "text": "⚠️ Failed to parse a Calendly webhook payload. Check the execution log — a meeting may not have been scheduled correctly.",
+        "options": {}
+      },
+      "name": "Alert Parse Failure",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2,
+      "position": [650, 500],
+      "credentials": {
+        "slackApi": {
+          "id": "YOUR_CREDENTIAL_ID",
+          "name": "Slack Account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Calendly Webhook": {
+      "main": [[{"node": "Parse Meeting Data", "type": "main", "index": 0}]]
+    },
+    "Parse Meeting Data": {
+      "main": [[{"node": "Parsed Successfully?", "type": "main", "index": 0}]]
+    },
+    "Parsed Successfully?": {
+      "main": [
+        [{"node": "Create Google Calendar Event", "type": "main", "index": 0}, {"node": "Notify Team on Slack", "type": "main", "index": 0}],
+        [{"node": "Alert Parse Failure", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Google Calendar Event": {
+      "main": [[{"node": "Send Confirmation Email", "type": "main", "index": 0}]]
+    },
+    "Send Confirmation Email": {
+      "main": [[{"node": "Log to CRM", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
