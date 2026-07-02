@@ -1,0 +1,39 @@
+{
+  "id": "14",
+  "name": "14_youtube_to_twitter_auto_post",
+  "nodes": [
+    {
+      "parameters": {},
+      "name": "YouTube Trigger",
+      "type": "n8n-nodes-base.youTubeTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        300
+      ]
+    },
+    {
+      "parameters": {},
+      "name": "Twitter",
+      "type": "n8n-nodes-base.twitter",
+      "typeVersion": 1,
+      "position": [
+        400,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "YouTube Trigger": {
+      "main": [
+        [
+          {
+            "node": "Twitter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
